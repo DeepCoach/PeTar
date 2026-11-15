@@ -1121,12 +1121,21 @@ public:
 #ifdef PROFILE
         profile.search_cluster.start();
 #endif
+#ifdef PTAR_ORACLE_DUMP
+        // oracle：把当前模拟时间注入插桩层（ClusterList 不持有演化状态）。
+        ptar_oracle::setTime(stat.time);
+#endif
         // >2.1 search clusters ----------------------------------------
         search_cluster.searchNeighborOMP<SystemSoft, TreeNB, EPJSoft>
             (system_soft, tree_nb, pos_domain, 1.0, input_parameters.r_search_peri_factor.value);
 
         search_cluster.searchClusterLocal();
         search_cluster.setIdClusterLocal();
+
+#ifdef PTAR_ORACLE_DUMP
+        // oracle L-k：本地传播完成后的连通分量（单 rank 即完整划分）。
+        search_cluster.oracleDumpClusters(system_soft);
+#endif
 
         // >2.2 Send/receive connect cluster
 #ifdef PARTICLE_SIMULATOR_MPI_PARALLEL        

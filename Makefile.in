@@ -16,6 +16,9 @@ ext_hard_mode=@with_external_hard@
 pn_mode=@with_pn@
 tt_mode=@with_tidal_tensor@
 orb_mode=@with_orbit@
+# Oracle 对拍插桩（`PTAR_ORACLE_DUMP`）：冻结状态分层导出，仅 oracle 分支使用。
+# 关闭时头文件内的插桩块整体不编译，浮点路径与基线构建逐位一致。
+use_oracle_dump=no
 
 CXXFLAGS=@CXXFLAGS@
 
@@ -60,6 +63,9 @@ endif
 #MT_FLAGS += -D HARD_CM_KICK
 ifeq ($(use_quad),yes)
 MT_FLAGS += -D USE_QUAD
+endif
+ifeq ($(use_oracle_dump),yes)
+MT_FLAGS += -D PTAR_ORACLE_DUMP
 endif
 #MT_FLAGS += -D COLLECT_SP_ACC
 MT_FLAGS += -D SOFT_PERT

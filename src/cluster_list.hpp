@@ -5,6 +5,202 @@
 #include"ptcl.hpp"
 #include"Common/binary_tree.h"
 
+#ifdef PTAR_ORACLE_DUMP
+#include<algorithm>
+#include<cstdio>
+#include<cstdlib>
+#include<fstream>
+#include<iomanip>
+#include<string>
+#include<utility>
+#include<vector>
+
+//! oracle 对拍插桩（仅 `PTAR_ORACLE_DUMP` 构建）。
+/*!
+  冻结状态分层导出：L-s 逐粒子状态、L-c 树查询后候选边、L-e 速度过滤后边、L-k cluster 划分。
+  列定义、身份映射与规范化规则见
+  `/home/chengx/dev/PTGd-perf-sc-oracle/runtime/tests/searchCluster/include/oracle_state_io.h`
+  文件头，以及 `sim/perf-searchcluster/README.md` 的「冻结状态复现手册」。
+
+  导出纪律：并行区内只向线程私有向量追加边对，层间写盘一律发生在 OpenMP 区之外；IO 失败仅告警，
+  不改变浮点路径，也不影响搜索流程的任何分支。
+
+  环境变量：`PTAR_ORACLE_PREFIX` 输出前缀（空/未设 = 关闭）；`PTAR_ORACLE_STAGE` 物理阶段标注
+  （如 first-search/post-capture/post-disrupt）；`PTAR_ORACLE_SEARCH` 只导出第 k 次搜索调用
+  （未设/0 = 全部导出）。多 rank 运行时 rank>0 的文件名追加 `.rank<r>`，避免互相覆盖；冻结对拍
+  以单 rank 序列为准。
+
+  本分支只服务 oracle、不回合上游：插桩提交不 bump VERSION、不改 release.note——版本串进入输出面
+  会破坏逐位一致对比。
+*/
+namespace ptar_oracle {
+
+typedef std::pair<PS::S64, PS::S64> Edge;
+
+struct Context{
+    std::string stage;
+    PS::S32 search_index;   ///< 1 基的 searchNeighborOMP 调用序号
+    PS::F64 time;           ///< 调用时刻的模拟时间（由 PeTar::searchCluster 注入）
+    PS::S32 rank;
+    PS::S32 n_proc;
+    PS::S32 n_local;
+    PS::F64 grav_const;
+    PS::F64 radius_factor;
+    Context(): stage("unspecified"), search_index(0), time(0.0), rank(0), n_proc(1),
+               n_local(0), grav_const(0.0), radius_factor(0.0) {}
+};
+
+inline Context & current(){
+    static Context ctx;
+    return ctx;
+}
+
+//! 模拟时间由 `PeTar::searchCluster` 在调用搜索前注入（ClusterList 不持有演化状态）。
+inline PS::F64 & pendingTime(){
+    static PS::F64 t = 0.0;
+    return t;
+}
+
+inline void setTime(const PS::F64 _t){
+    pendingTime() = _t;
+}
+
+inline bool enabled(){
+    static const char * prefix_tmp = std::getenv("PTAR_ORACLE_PREFIX");
+    return prefix_tmp != NULL && prefix_tmp[0] != '\0';
+}
+
+inline std::string prefix(){
+    const char * p = std::getenv("PTAR_ORACLE_PREFIX");
+    std::string s = (p != NULL) ? p : "";
+    const Context & ctx = current();
+    if(ctx.n_proc > 1 && ctx.rank > 0){
+        char suffix[32];
+        std::snprintf(suffix, sizeof(suffix), ".rank%d", int(ctx.rank));
+        s += suffix;
+    }
+    return s;
+}
+
+//! 每次 searchNeighborOMP 入口调用一次：推进序号并缓存本层导出需要的上下文。
+inline void beginSearch(const PS::S32 _rank, const PS::S32 _n_proc, const PS::S32 _n_loc,
+                        const PS::F64 _G, const PS::F64 _factor, const PS::F64 _time){
+    static PS::S32 counter = 0;
+    Context & ctx = current();
+    const char * stage = std::getenv("PTAR_ORACLE_STAGE");
+    ctx.stage         = (stage != NULL) ? stage : "unspecified";
+    ctx.search_index  = ++counter;
+    ctx.time          = _time;
+    ctx.rank          = _rank;
+    ctx.n_proc        = _n_proc;
+    ctx.n_local       = _n_loc;
+    ctx.grav_const    = _G;
+    ctx.radius_factor = _factor;
+}
+
+//! 本次调用是否导出（`PTAR_ORACLE_SEARCH` 未设或 0 时全部导出）。
+inline bool selected(){
+    const char * s = std::getenv("PTAR_ORACLE_SEARCH");
+    if(s == NULL) return true;
+    const int want = std::atoi(s);
+    return want == 0 || want == int(current().search_index);
+}
+
+inline void writeHeader(std::ostream & _fout, const char * _kind, const char * _columns){
+    const Context & ctx = current();
+    _fout<<"# oracle_"<<_kind<<" v1\n";
+    _fout<<"# producer=petar\n";
+    _fout<<"# stage="<<ctx.stage<<"\n";
+    _fout<<"# search_index="<<ctx.search_index<<"\n";
+    _fout<<"# time="<<std::setprecision(17)<<ctx.time<<"\n";
+    _fout<<"# rank="<<ctx.rank<<" n_proc="<<ctx.n_proc<<" n_local="<<ctx.n_local<<"\n";
+    _fout<<"# gravity_constant="<<ctx.grav_const<<"\n";
+    _fout<<"# r_search_peri_factor="<<ctx.radius_factor<<"\n";
+    _fout<<"# columns:"<<_columns<<"\n";
+}
+
+inline bool openFile(std::ofstream & _fout, const std::string & _path, const char * _layer){
+    _fout.open(_path.c_str());
+    if(!_fout.is_open()){
+        std::cerr<<"Warning: oracle dump cannot open "<<_path<<" (layer "<<_layer<<"), skipped."<<std::endl;
+        return false;
+    }
+    return true;
+}
+
+//! L-s：逐粒子状态列（位置/质量/速度、原始 r_search、成员 r_out、CM 质速、树邻居计数）。
+template<class Tsys>
+inline void writeState(const Tsys & _sys, const std::string & _prefix){
+    std::ofstream fout;
+    if(!openFile(fout, _prefix + ".state.txt", "state")) return;
+    writeHeader(fout, "state",
+                " uid src_id x y z mass vx vy vz r_search r_out"
+                " cm_mass cm_vx cm_vy cm_vz n_ngb");
+    fout<<std::setprecision(17);
+    const Context & ctx = current();
+    const bool cm_mode = (Ptcl::group_data_mode == GroupDataMode::cm);
+    for(PS::S32 i=0; i<ctx.n_local; i++){
+        // 粒子元素类型是 Tsys 的元素（SystemSoft → FPSoft，n_ngb 在 FPSoft 上），
+        // 不能写死成 Ptcl：Ptcl 没有 n_ngb。
+        const auto & p = _sys[i];
+        PS::F64 cm_mass = 0.0, cm_vx = 0.0, cm_vy = 0.0, cm_vz = 0.0;
+        if(cm_mode){
+            cm_mass = p.group_data.cm.mass;
+            cm_vx   = p.group_data.cm.vel.x;
+            cm_vy   = p.group_data.cm.vel.y;
+            cm_vz   = p.group_data.cm.vel.z;
+        }
+        // uid = 规范身份（本产出方 1 基 IC 行序；src_id = 产出方原生 id，PeTar 两者恒等）
+        fout<<p.id<<' '<<p.id<<' '
+            <<p.pos.x<<' '<<p.pos.y<<' '<<p.pos.z<<' '<<p.mass<<' '
+            <<p.vel.x<<' '<<p.vel.y<<' '<<p.vel.z<<' '
+            <<p.r_search<<' '<<p.changeover.getRout()<<' '
+            <<cm_mass<<' '<<cm_vx<<' '<<cm_vy<<' '<<cm_vz<<' '
+            <<p.n_ngb<<'\n';
+    }
+}
+
+//! 边表规范化：无向对 (min_id, max_id)，排序去重。
+inline void normalizeEdges(std::vector<Edge> & _edges){
+    for(size_t i=0; i<_edges.size(); i++){
+        if(_edges[i].first > _edges[i].second) std::swap(_edges[i].first, _edges[i].second);
+    }
+    std::sort(_edges.begin(), _edges.end());
+    _edges.erase(std::unique(_edges.begin(), _edges.end()), _edges.end());
+}
+
+//! L-c / L-e：边表导出（cand = 树查询后过滤前，edges = 速度判据过滤后）。
+inline void writeEdges(const std::string & _path, const char * _kind, std::vector<Edge> & _edges){
+    normalizeEdges(_edges);
+    std::ofstream fout;
+    if(!openFile(fout, _path, _kind)) return;
+    writeHeader(fout, _kind, " uid_min uid_max");
+    for(size_t i=0; i<_edges.size(); i++){
+        fout<<_edges[i].first<<' '<<_edges[i].second<<'\n';
+    }
+}
+
+//! L-k：连通分量导出，每行一个分量（成员升序，行按字典序），单体分量以单 id 成行。
+inline void writeClusters(const std::string & _path, std::vector< std::vector<PS::S64> > & _clusters){
+    for(size_t i=0; i<_clusters.size(); i++){
+        std::sort(_clusters[i].begin(), _clusters[i].end());
+    }
+    std::sort(_clusters.begin(), _clusters.end());
+    std::ofstream fout;
+    if(!openFile(fout, _path, "clusters")) return;
+    writeHeader(fout, "clusters", " uid ... (one connected component per line, ids ascending)");
+    for(size_t i=0; i<_clusters.size(); i++){
+        for(size_t j=0; j<_clusters[i].size(); j++){
+            if(j > 0) fout<<' ';
+            fout<<_clusters[i][j];
+        }
+        fout<<'\n';
+    }
+}
+
+} // namespace ptar_oracle
+#endif
+
 //extern const PS::F64 SAFTY_OFFSET_FOR_SEARCH;
 
 #ifndef ARRAY_ALLOW_LIMIT
@@ -440,6 +636,16 @@ public:
         assert(Ptcl::group_data_mode==GroupDataMode::cm);
 #endif
 
+#ifdef PTAR_ORACLE_DUMP
+        // oracle：入口推进搜索序号并导出 L-s；候选边/过滤后边在线程私有向量累积，并行区外统一写盘。
+        ptar_oracle::beginSearch(my_rank, PS::Comm::getNumberOfProc(), n_loc, _G, _radius_factor,
+                                 ptar_oracle::pendingTime());
+        const bool oracle_dump = ptar_oracle::enabled() && ptar_oracle::selected();
+        const std::string oracle_prefix = ptar_oracle::prefix();
+        std::vector< std::vector<ptar_oracle::Edge> > oracle_cand(n_thread), oracle_edge(n_thread);
+        if(oracle_dump) ptar_oracle::writeState(sys, oracle_prefix);
+#endif
+
 #pragma omp parallel
         {
             const PS::S32 ith = PS::Comm::getThreadNum();
@@ -515,6 +721,16 @@ public:
                     
                     PS::S32 adr_ngb_head_i = id_ngb_multi_cluster[ith].size();
                     PS::S32 n_ngb_i = sys[i].n_ngb;
+
+#ifdef PTAR_ORACLE_DUMP
+                    // L-c：树查询返回的邻居表（含 self，去 self 后即 peri 过滤前的候选边）。
+                    if(oracle_dump){
+                        for(PS::S32 j=0; j<=n_ngb_i; j++){
+                            if(nbl[j].id == sys[i].id) continue;
+                            oracle_cand[ith].push_back(ptar_oracle::Edge(sys[i].id, PS::S64(nbl[j].id)));
+                        }
+                    }
+#endif
                     
 #ifdef CLUSTER_VELOCITY
                     // Use velocity criterion to select neighbors
@@ -524,6 +740,15 @@ public:
                     assert(n_ngb_check>=0);
 #endif
                     sys[i].n_ngb = n_ngb_check;
+
+#ifdef PTAR_ORACLE_DUMP
+                    // L-e：通过速度判据的邻居（与 id_ngb_multi_cluster 写入口径一致）。
+                    if(oracle_dump){
+                        for(PS::S32 j=0; j<n_ngb_check; j++){
+                            oracle_edge[ith].push_back(ptar_oracle::Edge(sys[i].id, PS::S64(nbl[neighbor_index[j]].id)));
+                        }
+                    }
+#endif
 
                     // no neighbor
                     if (n_ngb_check==0) {
@@ -547,6 +772,10 @@ public:
                     for (int j=0; j<n_ngb_i+1; j++) {
                         auto* nbj = nbl + j;
                         if (sys[i].id==nbj->id) continue;
+#ifdef PTAR_ORACLE_DUMP
+                        // 无速度判据构建：全部候选即最终边。
+                        if(oracle_dump) oracle_edge[ith].push_back(ptar_oracle::Edge(sys[i].id, PS::S64(nbj->id)));
+#endif
                         
                         id_ngb_multi_cluster[ith].push_back( std::pair<PS::S32, PS::S32>(sys[i].id, nbj->id) );
                         if( nbj->rank_org != my_rank ){
@@ -558,6 +787,17 @@ public:
                 }
             }
         } // end of OMP parallel 
+#ifdef PTAR_ORACLE_DUMP
+        if(oracle_dump){
+            std::vector<ptar_oracle::Edge> oracle_cand_all, oracle_edge_all;
+            for(PS::S32 t=0; t<n_thread; t++){
+                oracle_cand_all.insert(oracle_cand_all.end(), oracle_cand[t].begin(), oracle_cand[t].end());
+                oracle_edge_all.insert(oracle_edge_all.end(), oracle_edge[t].begin(), oracle_edge[t].end());
+            }
+            ptar_oracle::writeEdges(oracle_prefix + ".cand.txt", "cand", oracle_cand_all);
+            ptar_oracle::writeEdges(oracle_prefix + ".edges.txt", "edges", oracle_edge_all);
+        }
+#endif
         packDataToThread0(adr_sys_one_cluster_);
         packDataToThread0(ptcl_cluster_);
         packDataToThread0(id_ngb_multi_cluster);
@@ -1377,6 +1617,85 @@ public:
     const PS::ReallocatableArray<PS::S32> & getAdrSysConnectClusterSend(){
         return adr_sys_ptcl_send_;
     }
+
+#ifdef PTAR_ORACLE_DUMP
+    //! oracle L-k：导出本次搜索得到的连通分量（含单体），成员用粒子 id 标识。
+    /*!
+      必须在 `searchClusterLocal()` 之后调用：`ptcl_cluster_` 与 `adr_ngb_multi_cluster_`
+      此时已是本次搜索的完整非孤立图。孤立单体来自 `adr_sys_one_cluster_`（速度判据后邻居数为零），
+      非孤立分量用本函数自己的并查集在 `ptcl_cluster_` 邻接表上重建——`PtclCluster::id_cluster_`
+      的单遍邻居最小值传播不能保证同一连通分量取到同一标签（链式图只有部分成员拿到最小值），
+      以它为分组键会把一个分量拆成多组。
+
+      单 rank 下所有 `adr_sys_` 均 >= 0，分量即完整划分；多 rank 时跨域分量在本地视图中含有
+      `adr_sys_ < 0` 的导入节点（本地无法得知远端连接），此类分量被跳过并计数告警——冻结对拍以
+      单 rank 序列为准。
+    */
+    template<class Tsys>
+    void oracleDumpClusters(const Tsys & _sys){
+        if(!ptar_oracle::enabled() || !ptar_oracle::selected()) return;
+
+        std::vector< std::vector<PS::S64> > clusters;
+
+        // 单体分量：速度判据后邻居数为零的粒子（self-only CSR 行）。
+        for(PS::S32 i=0; i<adr_sys_one_cluster_[0].size(); i++){
+            std::vector<PS::S64> component(1, PS::S64(_sys[adr_sys_one_cluster_[0][i]].id));
+            clusters.push_back(component);
+        }
+
+        // 非孤立分量：在 ptcl_cluster_ 邻接表上做本地并查集。
+        const PS::S32 n_pcluster = ptcl_cluster_[0].size();
+        std::vector<PS::S32> parent(n_pcluster);
+        for(PS::S32 i=0; i<n_pcluster; i++) parent[i] = i;
+        for(PS::S32 i=0; i<n_pcluster; i++){
+            const PtclCluster & node = ptcl_cluster_[0][i];
+            for(PS::S32 j=0; j<node.n_ngb_; j++){
+                const PS::S32 adr_ngb = adr_ngb_multi_cluster_[node.adr_ngb_head_+j].second;
+                if(adr_ngb < 0 || adr_ngb >= n_pcluster) continue;
+                // 路径减半的 union：找到两节点根后按序号取小者。
+                PS::S32 root_i = i;
+                while(parent[root_i] != root_i){
+                    parent[root_i] = parent[parent[root_i]];
+                    root_i = parent[root_i];
+                }
+                PS::S32 root_j = adr_ngb;
+                while(parent[root_j] != root_j){
+                    parent[root_j] = parent[parent[root_j]];
+                    root_j = parent[root_j];
+                }
+                if(root_i != root_j) parent[std::max(root_i, root_j)] = std::min(root_i, root_j);
+            }
+        }
+
+        // 按根聚合；含导入节点的分量跨 rank，本地视图不完整，跳过并告警一次。
+        std::map<PS::S32, std::vector<PS::S64> > non_isolated;
+        std::vector<char> root_has_imported(n_pcluster, 0);
+        for(PS::S32 i=0; i<n_pcluster; i++){
+            PS::S32 root = i;
+            while(parent[root] != root) root = parent[root];
+            if(ptcl_cluster_[0][i].adr_sys_ < 0){
+                root_has_imported[root] = 1;
+                continue;
+            }
+            non_isolated[root].push_back(PS::S64(_sys[ptcl_cluster_[0][i].adr_sys_].id));
+        }
+        PS::S32 n_cross_rank = 0;
+        for(std::map<PS::S32, std::vector<PS::S64> >::iterator itr = non_isolated.begin();
+            itr != non_isolated.end(); ++itr){
+            if(root_has_imported[itr->first]){
+                n_cross_rank++;
+                continue;
+            }
+            clusters.push_back(itr->second);
+        }
+        if(n_cross_rank > 0){
+            std::cerr<<"Warning: oracle L-k skipped "<<n_cross_rank
+                     <<" cross-rank component(s); frozen comparison requires a single rank."<<std::endl;
+        }
+
+        ptar_oracle::writeClusters(ptar_oracle::prefix() + ".clusters.txt", clusters);
+    }
+#endif
 
 };
 
